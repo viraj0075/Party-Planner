@@ -11,7 +11,7 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// Gemini Completion Helper using @google/genai with automatic retry on 503 errors
+// Gemini Completion Helper using @google/genai with automatic retry and model fallback
 async function generateCompletion(prompt: string, systemInstruction: string, jsonSchemaStr?: string): Promise<string> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -27,32 +27,40 @@ async function generateCompletion(prompt: string, systemInstruction: string, jso
     },
   });
 
+  const modelsToTry = ['gemini-3.7-flash', 'gemini-3.5-flash'];
   let lastError: any = null;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.7-flash',
-        contents: prompt,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-        },
-      });
 
-      const content = response.text;
-      if (!content) {
-        throw new Error('Empty response from Gemini model');
+  for (const modelName of modelsToTry) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model: modelName,
+          contents: prompt,
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+          },
+        });
+
+        const content = response.text;
+        if (!content) {
+          throw new Error('Empty response from Gemini model');
+        }
+        return content;
+      } catch (err: any) {
+        lastError = err;
+        const is503 = err.status === 503 || (err.message && (err.message.includes('503') || err.message.includes('high demand') || err.message.includes('UNAVAILABLE')));
+        if (is503 && attempt < 2) {
+          console.warn(`Gemini 503 received for model ${modelName}, retrying attempt ${attempt + 1}/2 after delay...`);
+          await new Promise(resolve => setTimeout(resolve, 800 * attempt));
+          continue;
+        }
+        if (is503 && modelsToTry.indexOf(modelName) < modelsToTry.length - 1) {
+          console.warn(`Gemini model ${modelName} failed with 503, falling back to next model...`);
+          break;
+        }
+        throw err;
       }
-      return content;
-    } catch (err: any) {
-      lastError = err;
-      const is503 = err.status === 503 || (err.message && (err.message.includes('503') || err.message.includes('high demand') || err.message.includes('UNAVAILABLE')));
-      if (is503 && attempt < 3) {
-        console.warn(`Gemini 503 received, retrying attempt ${attempt + 1}/3 after delay...`);
-        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-        continue;
-      }
-      throw err;
     }
   }
   throw lastError;
