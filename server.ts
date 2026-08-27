@@ -50,13 +50,17 @@ async function generateCompletion(prompt: string, systemInstruction: string, jso
       } catch (err: any) {
         lastError = err;
         const is503 = err.status === 503 || (err.message && (err.message.includes('503') || err.message.includes('high demand') || err.message.includes('UNAVAILABLE')));
-        if (is503 && attempt < 2) {
-          console.warn(`Gemini 503 received for model ${modelName}, retrying attempt ${attempt + 1}/2 after delay...`);
-          await new Promise(resolve => setTimeout(resolve, 800 * attempt));
+        const is429 = err.status === 429 || (err.message && (err.message.includes('429') || err.message.includes('quota') || err.message.includes('RESOURCE_EXHAUSTED')));
+        const isRetryable = is503 || is429;
+
+        if (isRetryable && attempt < 2) {
+          console.warn(`Gemini API error received for model ${modelName}, retrying attempt ${attempt + 1}/2 after delay...`);
+          const waitTime = is429 ? 2000 : 800;
+          await new Promise(resolve => setTimeout(resolve, waitTime * attempt));
           continue;
         }
-        if (is503 && modelsToTry.indexOf(modelName) < modelsToTry.length - 1) {
-          console.warn(`Gemini model ${modelName} failed with 503, falling back to next model...`);
+        if (isRetryable && modelsToTry.indexOf(modelName) < modelsToTry.length - 1) {
+          console.warn(`Gemini model ${modelName} failed, falling back to next model...`);
           break;
         }
         throw err;
