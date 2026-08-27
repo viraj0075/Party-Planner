@@ -38,6 +38,7 @@ async function generateCompletion(prompt: string, systemInstruction: string, jso
           config: {
             systemInstruction,
             responseMimeType: 'application/json',
+            maxOutputTokens: 8192,
           },
         });
 
