@@ -1,0 +1,8 @@
+{
+  "name": "CymbalMart Shopping Agent",
+  "description": "AI-powered party planning and smart shopping assistant with portion calculators, budget optimization, categorized lists, and store routing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
