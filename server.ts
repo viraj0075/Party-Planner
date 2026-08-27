@@ -1,7 +1,6 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 
 dotenv.config();
@@ -11,30 +10,84 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// Initialize Gemini Client
-let aiClient: GoogleGenAI | null = null;
+// Dual Completion Helper (supports Google Gemini and NVIDIA NIM)
+async function generateCompletion(prompt: string, systemInstruction: string, jsonSchemaStr: string): Promise<string> {
+  const apiKey = process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    throw new Error('NVIDIA_API_KEY or GEMINI_API_KEY is not set');
+  }
 
-function getGenAI(): GoogleGenAI {
-  if (!aiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      console.warn('GEMINI_API_KEY is not set. Using fallback algorithmic planners.');
+  if (apiKey.startsWith('nvapi-')) {
+    const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'nvidia/llama-3.1-nemotron-70b-instruct',
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: prompt + (jsonSchemaStr ? `\n\nYou MUST respond with valid JSON matching this schema:\n${jsonSchemaStr}` : '') }
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.2,
+        max_tokens: 4096,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`NVIDIA API error: ${response.status} - ${errText}`);
     }
-    aiClient = new GoogleGenAI({
-      apiKey: apiKey || 'dummy-key',
+
+    const data = await response.json() as any;
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error('Empty response from NVIDIA model');
+    }
+    return content;
+  } else {
+    const { GoogleGenAI } = await import('@google/genai');
+    const ai = new GoogleGenAI({
+      apiKey,
       httpOptions: {
         headers: {
           'User-Agent': 'aistudio-build',
         },
       },
     });
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        systemInstruction,
+        responseMimeType: 'application/json',
+      },
+    });
+
+    const content = response.text;
+    if (!content) {
+      throw new Error('Empty response from Gemini model');
+    }
+    return content;
   }
-  return aiClient;
+}
+
+function cleanJsonString(str: string): string {
+  let cleaned = str.trim();
+  if (cleaned.startsWith('```')) {
+    cleaned = cleaned.replace(/^```(?:json)?\n?/i, '');
+    cleaned = cleaned.replace(/\n?```$/, '');
+  }
+  return cleaned.trim();
 }
 
 // Health Check
 app.get('/api/health', (req: Request, res: Response) => {
-  res.json({ status: 'ok', hasGeminiKey: !!process.env.GEMINI_API_KEY });
+  const hasKey = !!(process.env.GEMINI_API_KEY || process.env.NVIDIA_API_KEY);
+  res.json({ status: 'ok', hasNvidiaKey: hasKey, hasGeminiKey: hasKey });
 });
 
 // Generate Comprehensive Party Plan & Shopping List
@@ -57,14 +110,89 @@ app.post('/api/plan-party', async (req: Request, res: Response) => {
       customRequests = '',
     } = details;
 
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
       // Fallback generator when key is not present
       return res.json(generateFallbackPlan(details));
     }
 
-    const ai = getGenAI();
+    const schemaStr = `{
+  "items": [
+    {
+      "name": "string",
+      "category": "food | drinks | decor | entertainment | supplies",
+      "quantity": number,
+      "unit": "string (e.g. bottles, lbs, packs, boxes, bags, units)",
+      "estimatedCost": number (in USD),
+      "store": "string",
+      "notes": "string",
+      "priority": "must-have | nice-to-have | backup",
+      "portionBasis": "string (e.g. 2 per person for 20 guests)",
+      "suggestedAlternative": {
+        "name": "string",
+        "costDiff": number (Negative number for savings, e.g. -12),
+        "reason": "string"
+      }
+    }
+  ],
+  "portionMetrics": [
+    {
+      "category": "string",
+      "item": "string",
+      "calculation": "string",
+      "ruleExplanation": "string",
+      "recommendedAmount": "string"
+    }
+  ],
+  "timeline": [
+    {
+      "timeframe": "2_weeks_prior | 1_week_prior | 2_days_prior | 1_day_prior | day_of_morning",
+      "timeframeLabel": "string (e.g. 2 Weeks Before, 1 Day Before)",
+      "title": "string",
+      "description": "string",
+      "tasks": [
+        {
+          "text": "string"
+        }
+      ]
+    }
+  ],
+  "budgetOptimization": {
+    "overallAnalysis": "string",
+    "savingsTips": [
+      {
+        "title": "string",
+        "potentialSavings": number,
+        "action": "string"
+      }
+    ],
+    "splurgeRecommendations": [
+      {
+        "title": "string",
+        "extraCost": number,
+        "impact": "string"
+      }
+    ]
+  },
+  "signatureRecipe": {
+    "title": "string",
+    "description": "string",
+    "type": "cocktail | mocktail | punch | dish | snack",
+    "servings": number,
+    "ingredients": [
+      {
+        "name": "string",
+        "amount": "string",
+        "estimatedCost": number
+      }
+    ],
+    "instructions": [
+      "string"
+    ],
+    "tips": "string"
+  }
+}`;
 
     const prompt = `You are the CymbalMart Party Planning & Smart Shopping Agent.
 Create a comprehensive, realistic, and budget-conscious party shopping plan, aisle routing, and timeline for the following party details:
@@ -89,157 +217,18 @@ Make sure your calculations follow real party hosting math and CymbalMart depart
 7. Include portion reasoning for major food/beverage items.
 8. Include a signature themed cocktail/mocktail/punch recipe with exact proportions for ${guestCount} guests.
 9. Provide 4-6 time-phased prep & shopping steps ("2_weeks_prior", "1_week_prior", "2_days_prior", "1_day_prior", "day_of_morning").
-10. Provide budget optimization analysis with 2-3 specific savings tips and 1-2 splurge ideas.`;
+10. Provide budget optimization analysis with 2-3 specific savings tips and 1-2 splurge ideas.
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.7-flash',
-      contents: prompt,
-      config: {
-        systemInstruction:
-          'You are a professional party planner and smart shopping master. Always respond with strict, well-structured JSON adhering to the specified schema.',
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            items: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  category: {
-                    type: Type.STRING,
-                    description: 'food, drinks, decor, entertainment, supplies',
-                  },
-                  quantity: { type: Type.NUMBER },
-                  unit: { type: Type.STRING, description: 'e.g. bottles, lbs, packs, boxes, bags, units' },
-                  estimatedCost: { type: Type.NUMBER, description: 'Estimated cost in USD' },
-                  store: { type: Type.STRING },
-                  notes: { type: Type.STRING },
-                  priority: { type: Type.STRING, description: 'must-have, nice-to-have, backup' },
-                  portionBasis: { type: Type.STRING, description: 'e.g. 2 per person for 20 guests' },
-                  suggestedAlternative: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING },
-                      costDiff: { type: Type.NUMBER, description: 'Negative number for savings, e.g. -12' },
-                      reason: { type: Type.STRING },
-                    },
-                  },
-                },
-                required: ['name', 'category', 'quantity', 'unit', 'estimatedCost', 'store', 'priority'],
-              },
-            },
-            portionMetrics: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  category: { type: Type.STRING },
-                  item: { type: Type.STRING },
-                  calculation: { type: Type.STRING },
-                  ruleExplanation: { type: Type.STRING },
-                  recommendedAmount: { type: Type.STRING },
-                },
-                required: ['category', 'item', 'calculation', 'ruleExplanation', 'recommendedAmount'],
-              },
-            },
-            timeline: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  timeframe: {
-                    type: Type.STRING,
-                    description: '2_weeks_prior, 1_week_prior, 2_days_prior, 1_day_prior, day_of_morning',
-                  },
-                  timeframeLabel: { type: Type.STRING, description: 'e.g. 2 Weeks Before, 1 Day Before' },
-                  title: { type: Type.STRING },
-                  description: { type: Type.STRING },
-                  tasks: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        text: { type: Type.STRING },
-                      },
-                      required: ['text'],
-                    },
-                  },
-                },
-                required: ['timeframe', 'timeframeLabel', 'title', 'description', 'tasks'],
-              },
-            },
-            budgetOptimization: {
-              type: Type.OBJECT,
-              properties: {
-                overallAnalysis: { type: Type.STRING },
-                savingsTips: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      title: { type: Type.STRING },
-                      potentialSavings: { type: Type.NUMBER },
-                      action: { type: Type.STRING },
-                    },
-                    required: ['title', 'potentialSavings', 'action'],
-                  },
-                },
-                splurgeRecommendations: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      title: { type: Type.STRING },
-                      extraCost: { type: Type.NUMBER },
-                      impact: { type: Type.STRING },
-                    },
-                    required: ['title', 'extraCost', 'impact'],
-                  },
-                },
-              },
-              required: ['overallAnalysis', 'savingsTips', 'splurgeRecommendations'],
-            },
-            signatureRecipe: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                description: { type: Type.STRING },
-                type: { type: Type.STRING, description: 'cocktail, mocktail, punch, dish, snack' },
-                servings: { type: Type.NUMBER },
-                ingredients: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING },
-                      amount: { type: Type.STRING },
-                      estimatedCost: { type: Type.NUMBER },
-                    },
-                    required: ['name', 'amount'],
-                  },
-                },
-                instructions: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                },
-                tips: { type: Type.STRING },
-              },
-              required: ['title', 'description', 'type', 'servings', 'ingredients', 'instructions'],
-            },
-          },
-          required: ['items', 'portionMetrics', 'timeline', 'budgetOptimization'],
-        },
-      },
-    });
+You MUST respond with valid JSON that matches the following JSON schema:
+${schemaStr}`;
 
-    const text = response.text;
-    if (!text) {
-      throw new Error('Empty response from AI model');
-    }
+    const text = await generateCompletion(
+      prompt,
+      'You are a professional party planner and smart shopping master. Always respond with strict, well-structured JSON adhering to the specified schema.',
+      schemaStr
+    );
 
-    const parsed = JSON.parse(text);
+    const parsed = JSON.parse(cleanJsonString(text));
 
     // Normalize IDs and checked states
     const itemsWithIds = (parsed.items || []).map((it: any, idx: number) => ({
@@ -303,15 +292,13 @@ Make sure your calculations follow real party hosting math and CymbalMart depart
 app.post('/api/agent-chat', async (req: Request, res: Response) => {
   try {
     const { message, partyPlan, history = [] } = req.body;
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
       return res.json({
         content: `Hi there! I'm your CymbalMart Assistant. Since we're running in offline mode, you can freely browse our aisles, customize your party checklist, adjust portion quantities, and track your budget right on screen. How can I help you prepare today?`,
       });
     }
-
-    const ai = getGenAI();
 
     // Format previous chat history for multi-turn context
     const historyText = Array.isArray(history) && history.length > 0
@@ -372,17 +359,13 @@ Return a valid JSON object matching this schema:
   }
 }`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.7-flash',
-      contents: prompt,
-      config: {
-        systemInstruction:
-          'You are "CymbalMart Assistant", the premier customer chatbot for CymbalMart retail and party shopping. Always maintain a polite, resourceful, and helpful customer service tone. Return valid JSON.',
-        responseMimeType: 'application/json',
-      },
-    });
+    const text = await generateCompletion(
+      prompt,
+      'You are "CymbalMart Assistant", the premier customer chatbot for CymbalMart retail and party shopping. Always maintain a polite, resourceful, and helpful customer service tone. Return valid JSON.',
+      ''
+    );
 
-    const parsed = JSON.parse(response.text || '{}');
+    const parsed = JSON.parse(cleanJsonString(text || '{}'));
     res.json(parsed);
   } catch (error: any) {
     console.error('Error in CymbalMart assistant chat:', error);
@@ -396,7 +379,7 @@ Return a valid JSON object matching this schema:
 app.post('/api/suggest-recipe', async (req: Request, res: Response) => {
   try {
     const { partyDetails, recipeType = 'cocktail' } = req.body;
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
       return res.json({
@@ -420,7 +403,6 @@ app.post('/api/suggest-recipe', async (req: Request, res: Response) => {
       });
     }
 
-    const ai = getGenAI();
     const prompt = `Create an incredible signature ${recipeType} recipe perfectly styled for this party:
 - Theme: ${partyDetails?.theme || 'Celebration'}
 - Event Type: ${partyDetails?.eventType || 'Party'}
@@ -443,15 +425,13 @@ Return JSON:
   "tips": "Pro prep tip for the host"
 }`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.7-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-      },
-    });
+    const text = await generateCompletion(
+      prompt,
+      'You are a professional recipe generator. Return valid JSON.',
+      ''
+    );
 
-    const parsed = JSON.parse(response.text || '{}');
+    const parsed = JSON.parse(cleanJsonString(text || '{}'));
     res.json(parsed);
   } catch (error: any) {
     console.error('Error suggesting recipe:', error);
