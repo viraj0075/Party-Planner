@@ -1,6 +1,7 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
+import { GoogleGenAI } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 
 dotenv.config();
@@ -10,69 +11,51 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// Dual Completion Helper (supports Google Gemini and NVIDIA NIM)
-async function generateCompletion(prompt: string, systemInstruction: string, jsonSchemaStr: string): Promise<string> {
-  const apiKey = process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY;
+// Gemini Completion Helper using @google/genai with automatic retry on 503 errors
+async function generateCompletion(prompt: string, systemInstruction: string, jsonSchemaStr?: string): Promise<string> {
+  const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error('NVIDIA_API_KEY or GEMINI_API_KEY is not set');
+    throw new Error('GEMINI_API_KEY is not set');
   }
 
-  if (apiKey.startsWith('nvapi-')) {
-    const response = await fetch('https://integrate.api.nvidia.com/v1/chat/completions', {
-      method: 'POST',
+  const ai = new GoogleGenAI({
+    apiKey,
+    httpOptions: {
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
+        'User-Agent': 'aistudio-build',
       },
-      body: JSON.stringify({
-        model: 'nvidia/llama-3.1-nemotron-70b-instruct',
-        messages: [
-          { role: 'system', content: systemInstruction },
-          { role: 'user', content: prompt + (jsonSchemaStr ? `\n\nYou MUST respond with valid JSON matching this schema:\n${jsonSchemaStr}` : '') }
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.2,
-        max_tokens: 4096,
-      }),
-    });
+    },
+  });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`NVIDIA API error: ${response.status} - ${errText}`);
-    }
-
-    const data = await response.json() as any;
-    const content = data.choices?.[0]?.message?.content;
-    if (!content) {
-      throw new Error('Empty response from NVIDIA model');
-    }
-    return content;
-  } else {
-    const { GoogleGenAI } = await import('@google/genai');
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
+  let lastError: any = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.7-flash',
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
         },
-      },
-    });
+      });
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-      },
-    });
-
-    const content = response.text;
-    if (!content) {
-      throw new Error('Empty response from Gemini model');
+      const content = response.text;
+      if (!content) {
+        throw new Error('Empty response from Gemini model');
+      }
+      return content;
+    } catch (err: any) {
+      lastError = err;
+      const is503 = err.status === 503 || (err.message && (err.message.includes('503') || err.message.includes('high demand') || err.message.includes('UNAVAILABLE')));
+      if (is503 && attempt < 3) {
+        console.warn(`Gemini 503 received, retrying attempt ${attempt + 1}/3 after delay...`);
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        continue;
+      }
+      throw err;
     }
-    return content;
   }
+  throw lastError;
 }
 
 function cleanJsonString(str: string): string {
@@ -86,8 +69,8 @@ function cleanJsonString(str: string): string {
 
 // Health Check
 app.get('/api/health', (req: Request, res: Response) => {
-  const hasKey = !!(process.env.GEMINI_API_KEY || process.env.NVIDIA_API_KEY);
-  res.json({ status: 'ok', hasNvidiaKey: hasKey, hasGeminiKey: hasKey });
+  const hasKey = !!process.env.GEMINI_API_KEY;
+  res.json({ status: 'ok', hasGeminiKey: hasKey });
 });
 
 // Generate Comprehensive Party Plan & Shopping List
@@ -110,7 +93,7 @@ app.post('/api/plan-party', async (req: Request, res: Response) => {
       customRequests = '',
     } = details;
 
-    const apiKey = process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
       // Fallback generator when key is not present
@@ -292,7 +275,7 @@ ${schemaStr}`;
 app.post('/api/agent-chat', async (req: Request, res: Response) => {
   try {
     const { message, partyPlan, history = [] } = req.body;
-    const apiKey = process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
       return res.json({
@@ -379,7 +362,7 @@ Return a valid JSON object matching this schema:
 app.post('/api/suggest-recipe', async (req: Request, res: Response) => {
   try {
     const { partyDetails, recipeType = 'cocktail' } = req.body;
-    const apiKey = process.env.NVIDIA_API_KEY || process.env.GEMINI_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
       return res.json({
